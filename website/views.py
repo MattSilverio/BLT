@@ -10,7 +10,7 @@ import stripe
 import humanize
 from collections import deque
 from datetime import datetime, timezone, timedelta
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 from urllib.parse import urlsplit
 
 import requests
@@ -84,7 +84,20 @@ from .forms import FormInviteFriend, UserProfileForm, HuntForm, CaptchaForm
 from decimal import Decimal
 from django.conf import settings
 from comments.models import Comment
+from django.core.validators import URLValidator
+from django.core.exceptions import ValidationError
 
+def is_valid_https_url(url):
+    validate = URLValidator(schemes=['https'])  # Only allow HTTPS URLs
+    try:
+        validate(url)
+        return True
+    except ValidationError:
+        return False
+def rebuild_safe_url(url):
+    parsed_url = urlparse(url)
+    # Rebuild the URL with scheme, netloc, and path only
+    return urlunparse((parsed_url.scheme, parsed_url.netloc, parsed_url.path, '', '', ''))
 
 #@cache_page(60 * 60 * 24)
 def index(request, template="index.html"):
@@ -166,6 +179,88 @@ def index(request, template="index.html"):
     }
     return render(request, template, context)
 
+#@cache_page(60 * 60 * 24)
+def newhome(request, template="new_home.html"):
+    
+    try:
+        if not EmailAddress.objects.get(email=request.user.email).verified:
+            messages.error(request, "Please verify your email address")
+    except:
+        pass
+
+    bugs=Issue.objects.exclude(Q(is_hidden=True) & ~Q(user_id=request.user.id))
+    bugs_screenshots = {}
+
+    for bug in bugs:
+        bugs_screenshots[bug] = IssueScreenshot.objects.filter(issue=bug)[0:3]
+
+    # latest_hunts_filter = request.GET.get("latest_hunts",None)
+
+    # bug_count = Issue.objects.all().count()
+    # user_count = User.objects.all().count()
+    # hunt_count = Hunt.objects.all().count()
+    # domain_count = Domain.objects.all().count()
+
+    # captcha_form = CaptchaForm()
+
+    # wallet = None
+    # if request.user.is_authenticated:
+    #     wallet, created = Wallet.objects.get_or_create(user=request.user)
+
+    # activity_screenshots = {}
+    # for activity in Issue.objects.all():
+    #     activity_screenshots[activity] = IssueScreenshot.objects.filter(issue=activity).first()
+
+    # top_companies = Issue.objects.values("domain__name").annotate(count=Count('domain__name')).order_by("-count")[:10]
+    # top_testers = Issue.objects.values("user__id","user__username").filter(user__isnull=False).annotate(count=Count('user__username')).order_by("-count")[:10]
+    # activities = Issue.objects.exclude(Q(is_hidden=True) & ~Q(user_id=request.user.id))[0:10]
+
+    # top_hunts = Hunt.objects.values(
+    #     'id',
+    #     'name',
+    #     'url',
+    #     'logo',
+    #     'starts_on',
+    #     'starts_on__day',
+    #     'starts_on__month',
+    #     'starts_on__year',
+    #     'end_on',
+    #     'end_on__day',
+    #     'end_on__month',
+    #     'end_on__year',
+    # ).annotate(total_prize=Sum("huntprize__value"))
+
+    # if latest_hunts_filter != None:
+    #     top_hunts = top_hunts.filter(result_published=True).order_by("-created")[:3]
+    # else:
+    #     top_hunts = top_hunts.filter(is_published=True,result_published=False).order_by("-created")[:3]
+
+
+    context = {
+        "bugs": bugs,
+        "bugs_screenshots" : bugs_screenshots,
+        # "server_url": request.build_absolute_uri('/'),
+        # "activities": activities,
+        # "hunts": Hunt.objects.exclude(txn_id__isnull=True)[:4],
+        # "leaderboard": User.objects.filter(
+        #     points__created__month=datetime.now().month,
+        #     points__created__year=datetime.now().year,
+        # )
+        # .annotate(total_score=Sum("points__score"))
+        # .order_by("-total_score")[:10],
+        # "bug_count": bug_count,
+        # "user_count": user_count,
+        # "hunt_count": hunt_count,
+        # "domain_count": domain_count,
+        # "wallet": wallet,
+        # "captcha_form": captcha_form,
+        # "activity_screenshots":activity_screenshots,
+        # "top_companies":top_companies,
+        # "top_testers":top_testers,
+        # "top_hunts": top_hunts,
+        # "ended_hunts": False if latest_hunts_filter == None else True 
+    }
+    return render(request, template, context)
 
 def github_callback(request):
     ALLOWED_HOSTS = ['github.com']
@@ -560,9 +655,17 @@ class IssueCreate(IssueBaseCreate, CreateView):
                     pass
 
                 else:
-                    response = requests.get( "https://" + url ,timeout=2)
-                    if response.status_code == 200:
-                        print('Web site exists')
+                    full_url = "https://" + url
+                    if is_valid_https_url(full_url):
+                        safe_url = rebuild_safe_url(full_url)
+                        try:
+                            response = requests.get(safe_url, timeout=5)
+                            if response.status_code == 200:
+                                print('Web site exists')
+                            else:
+                                raise Exception
+                        except Exception as e:
+                            raise Exception
                     else:
                         raise Exception
             except:
@@ -735,7 +838,7 @@ class IssueCreate(IssueBaseCreate, CreateView):
                 return JsonResponse("Created", safe=False)
             else:
                 self.process_issue(self.request.user, obj, domain_exists, domain)
-                return HttpResponseRedirect(self.request.META.get("HTTP_REFERER"))
+                return HttpResponseRedirect(redirect_url + "/")
         
         return create_issue(self,form)
 
@@ -763,6 +866,7 @@ class IssueCreate(IssueBaseCreate, CreateView):
             context["hunts"] = Hunt.objects.values("id","name").filter(is_published=True,result_published=False)
             context["report_on_hunt"] = False
 
+        context['top_domains'] = Issue.objects.values("domain__name").annotate(count=Count('domain__name')).order_by("-count")[:30]
 
 
         return context
@@ -793,9 +897,12 @@ class InviteCreate(TemplateView):
         if email:
             domain = email.split("@")[-1]
             try:
-                ret = urllib.request.urlopen("http://" + domain + "/favicon.ico")
-                if ret.code == 200:
-                    exists = "exists"
+                full_url_domain = "https://" + domain + "/favicon.ico"
+                if is_valid_https_url(full_url_domain):
+                    safe_url = rebuild_safe_url(full_url_domain)
+                    response = requests.get(safe_url, timeout=5)
+                    if response.status_code == 200:
+                        exists = "exists"
             except:
                 pass
         context = {
@@ -1444,7 +1551,7 @@ def search(request, template="search.html"):
             "query": query,
             "type": stype,
             "users": UserProfile.objects.filter(
-                Q(user__username__icontains=query), hunt=None
+                Q(user__username__icontains=query)
             )
             .annotate(total_score=Sum("user__points__score"))
             .order_by("-total_score")[0:20],
@@ -1592,6 +1699,8 @@ class IssueView(DetailView):
         context["all_users"] = User.objects.all()
         context["likes"] = UserProfile.objects.filter(issue_upvoted=self.object).count()
         context["likers"] = UserProfile.objects.filter(issue_upvoted=self.object)
+        context["dislikes"] = UserProfile.objects.filter(issue_downvoted=self.object).count()
+        context["dislikers"] = UserProfile.objects.filter(issue_downvoted=self.object)
 
         context["flags"] = UserProfile.objects.filter(issue_flaged=self.object).count()
         context["flagers"] = UserProfile.objects.filter(issue_flaged=self.object)
@@ -1881,6 +1990,10 @@ def like_issue(request, issue_pk):
     issue_pk = int(issue_pk)
     issue = Issue.objects.get(pk=issue_pk)
     userprof = UserProfile.objects.get(user=request.user)
+
+    if userprof in UserProfile.objects.filter(issue_downvoted=issue):
+        userprof.issue_downvoted.remove(issue)
+
     if userprof in UserProfile.objects.filter(issue_upvoted=issue):
         userprof.issue_upvoted.remove(issue)
     else:
@@ -1917,7 +2030,37 @@ def like_issue(request, issue_pk):
     total_votes = UserProfile.objects.filter(issue_upvoted=issue).count()
     context["object"] = issue
     context["likes"] = total_votes
-    return render(request, "_likes.html", context)
+    context["likers"] = UserProfile.objects.filter(issue_upvoted=issue)
+    context["dislikes"] = UserProfile.objects.filter(issue_downvoted=issue).count()
+    context["dislikers"] = UserProfile.objects.filter(issue_downvoted=issue)
+
+    return render(request, "_likes_and_dislikes.html", context)
+
+
+@login_required(login_url="/accounts/login")
+def dislike_issue(request, issue_pk):
+    context = {}
+    issue_pk = int(issue_pk)
+    issue = Issue.objects.get(pk=issue_pk)
+    userprof = UserProfile.objects.get(user=request.user)
+
+    if userprof in UserProfile.objects.filter(issue_upvoted=issue):
+        userprof.issue_upvoted.remove(issue)
+    
+    if userprof in UserProfile.objects.filter(issue_downvoted=issue):
+        userprof.issue_downvoted.remove(issue)
+    else:
+        userprof.issue_downvoted.add(issue)
+
+    userprof.save()
+    total_downvotes = UserProfile.objects.filter(issue_downvoted=issue).count()
+    context["object"] = issue
+    context["likes"] = UserProfile.objects.filter(issue_upvoted=issue).count()
+    context["likers"] = UserProfile.objects.filter(issue_upvoted=issue)
+    context["dislikes"] = total_downvotes
+    context["dislikers"] = UserProfile.objects.filter(issue_downvoted=issue)
+
+    return render(request, "_likes_and_dislikes.html", context)
 
 
 @login_required(login_url="/accounts/login")
